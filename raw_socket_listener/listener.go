@@ -16,12 +16,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"database/sql"
 	"github.com/buger/gor/proto"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	_ "github.com/go-sql-driver/mysql"
 	"io"
 	"log"
+	"os"
 	"net"
 	"runtime"
 	"runtime/debug"
@@ -29,9 +32,51 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"encoding/json"
+	"io/ioutil"
 )
 
 var _ = fmt.Println
+
+var db *sql.DB
+var hostname string
+ 
+func init() {
+	var conf_map = map[string]string{}
+	var connect_str string
+	hostname, _ = os.Hostname()
+	bytes, err := ioutil.ReadFile("./mysql.conf")
+	
+	if err != nil{
+		log.Fatal(err)
+		os.Exit(1)
+	}
+	if err := json.Unmarshal(bytes, &conf_map); err != nil {
+		log.Fatal(err)
+		os.Exit(1)
+	}
+	user, ok1     := conf_map["user"]
+	passwd, ok2   := conf_map["passwd"]
+	host, ok3     := conf_map["host"]
+	port, ok4     := conf_map["port"]
+	database, ok5 := conf_map["database"]
+	
+	if !(ok1 && ok2 && ok3 && ok4 && ok5){
+		log.Fatal("the mysql info is not set, please check the mysql.conf")
+		os.Exit(1)
+	}
+	connect_str = user + ":" + passwd + "@tcp(" + host + ":" + port + ")/" + database + "?charset=utf8"
+	dbinfo, err:= sql.Open("mysql", connect_str)
+	db = dbinfo
+
+	if err != nil{
+		log.Fatal(err)
+		os.Exit(1)
+	}
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
+	db.Ping()
+}
 
 type packet struct {
 	srcIP     []byte
@@ -111,7 +156,7 @@ func NewListener(addr string, port string, engine int, trackResponse bool, expir
 	l.port = uint16(_port)
 
 	if expire.Nanoseconds() == 0 {
-		expire = 2000 * time.Millisecond
+		expire = 60 * time.Second
 	}
 
 	l.messageExpire = expire
@@ -229,9 +274,52 @@ func (t *Listener) dispatchMessage(message *TCPMessage) {
 		}
 	}
 
+  logtoDB(message)
+  
 	t.messagesChan <- message
 }
 
+func logtoDB(message *TCPMessage) {
+	
+	if !message.IsIncoming {
+		if message.AssocMessage == nil {
+			return
+		} 
+		payload := message.AssocMessage.Bytes()
+		method := string(proto.Method(payload))
+
+		if method == "OPTIONS" {
+			return
+		} 
+
+		host := string(proto.Header(payload, []byte("Host")))
+		pathargs := string(proto.Path(payload))
+		index := strings.IndexAny(pathargs, "?")
+		
+		path :=pathargs
+		args := ""
+		if index != -1 {
+			path = pathargs[:index]
+			args = pathargs[index+1:]
+		} 
+		request_body := string(proto.Body(payload))
+		
+		payload = message.Bytes()
+		http_code := string(proto.Status(payload))
+		resp_body := string(proto.Body(payload))
+		used_time := message.End.Sub(message.AssocMessage.Start)
+
+		for i := 0; i <= 5; i++ {
+			_, err:= db.Exec(`INSERT http_log (hostname,host,path,method,args,request_body,start_time,used_time,http_code,resp_body) values (?,?,?,?,?,?,?,?,?,?)`,
+		                     hostname,host, path, method, args, request_body, message.Start.Add(time.Hour * 8),used_time.Seconds()*1000,http_code,resp_body)
+			if err == nil {
+				break
+			}
+			log.Println("ERROR Occurred when INSERT into table http_log", i, err)
+			time.Sleep(1000 * time.Millisecond)
+		}
+	}
+}
 // DeviceNotFoundError raised if user specified wrong ip
 type DeviceNotFoundError struct {
 	addr string
@@ -724,7 +812,7 @@ func (t *Listener) processTCPPacket(packet *TCPPacket) {
 	}
 
 	message, ok := t.messages[packet.ID]
-
+  
 	if !ok {
 		message = NewTCPMessage(packet.Seq, packet.Ack, isIncoming, packet.timestamp)
 		t.messages[packet.ID] = message
